@@ -1,1 +1,1 @@
-sudo grep -nA20 -B5 'location /' /etc/nginx/nginx.conf
+sudo tail -n 50 /var/log/nginx/error.log
