@@ -1,1 +1,2 @@
-kubectl get awx awx -n agent-system -o yaml > awx.yaml
+kubectl logs deployment/agent-web -n agent-system \
+  -c agent-web --tail=200 | grep -iE 'csrf|forbidden|origin|host'
