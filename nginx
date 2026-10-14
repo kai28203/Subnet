@@ -1,4 +1,1 @@
-kubectl get secret agent-admin-password \
-  -n agent-system \
-  -o jsonpath='{.data.password}' | base64 -d
-echo
+kubectl get awx awx -n agent-system -o yaml > awx.yaml
