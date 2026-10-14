@@ -15,3 +15,33 @@ kubectl get configmap agent-awx-configmap -n agent-system \
 kubectl get configmap agent-awx-configmap -n agent-system \
   -o jsonpath='{.data.settings\.py}' | \
   grep -iE 'CSRF_TRUSTED_ORIGINS|ALLOWED_HOSTS|USE_X_FORWARDED_HOST|SECURE_PROXY_SSL_HEADER'
+
+
+
+//linux-connectivity.yaml
+
+---
+- name: Linux Server Connectivity Test
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Check SSH connectivity
+      ansible.builtin.ping:
+
+    - name: Get target server hostname
+      ansible.builtin.command: hostname
+      register: hostname_output
+      changed_when: false
+
+    - name: Display hostname
+      ansible.builtin.debug:
+        msg: "Connected successfully to {{ hostname_output.stdout }}"
+
+    - name: Check disk space
+      ansible.builtin.command: df -h /
+      register: disk_output
+      changed_when: false
+
+    - name: Display disk space
+      ansible.builtin.debug:
+        var: disk_output.stdout
