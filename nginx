@@ -7,3 +7,11 @@ location / {
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
 }
+
+
+kubectl get configmap agent-awx-configmap -n agent-system \
+  -o jsonpath='{.data.settings\.py}'
+
+kubectl get configmap agent-awx-configmap -n agent-system \
+  -o jsonpath='{.data.settings\.py}' | \
+  grep -iE 'CSRF_TRUSTED_ORIGINS|ALLOWED_HOSTS|USE_X_FORWARDED_HOST|SECURE_PROXY_SSL_HEADER'
