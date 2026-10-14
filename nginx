@@ -1,3 +1,4 @@
-sudo ausearch -m AVC -ts recent
-sudo setsebool -P httpd_can_network_connect 1
-curl -v --connect-timeout 5 http://192.168.49.2:32219/
+kubectl get secret agent-admin-password \
+  -n agent-system \
+  -o jsonpath='{.data.password}' | base64 -d
+echo
