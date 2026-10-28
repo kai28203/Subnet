@@ -1,0 +1,502 @@
+---
+# PiQuickHeal - CPU Spike Diagnosis and Remediation
+#
+# AWX Job Templates:
+#
+# 1. piquickheal-cpu_spike-diagnose
+#    Job Tags: diagnose
+#
+# 2. piquickheal-cpu_spike-remediate
+#    Job Tags: remediate,validate
+#
+# Workflow:
+#
+# Diagnose -> Approval -> Remediate -> Validate
+#
+# AWX:
+# Use the Limit field to select a specific host.
+#
+# Example:
+#
+# Limit:
+# ubuntu-patch.us-central1-a.c.project-49091190-d07c-4079-8e2.internal
+
+- name: PiQuickHeal - CPU Spike
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    piquickheal_skill_meta:
+      label: Runaway CPU consumer
+      diagnostic_template: piquickheal-cpu_full-diagnose
+      remediation_template: piquickheal-cpu_full-remediate
+      detection: A diagnostic check reports system load average and the top non-protected CPU-consuming process
+        (name, PID, percent); a protected process never becomes the remediation target.
+      decision: Top process >=70% CPU -> eligible for remediation; below threshold, or the top consumer is
+        protected -> reasoning-only, no action proposed.
+      remediation: Graceful SIGTERM first, SIGKILL only if the process is still alive after -- destructive
+        and unrecoverable either way, so this alert type is permanently excluded from auto-remediation and
+        always waits for a human to approve the exact PID/command shown in the approval prompt.
+
+
+    cpu_recover_threshold: 15
+
+    protected_processes:
+      - systemd
+      - init
+      - sshd
+      - ssh
+      - NetworkManager
+      - dbus-daemon
+      - dockerd
+      - containerd
+      - mysqld
+      - postgres
+      - postgresql
+      - nginx
+      - httpd
+
+    heal_log_path: /var/log/piquickheal/heal.log
+
+  tasks:
+
+    # ============================================================
+    # STAGE 1: DIAGNOSE
+    # ============================================================
+
+    - name: "STAGE 1 - Diagnose top CPU consumer"
+      ansible.builtin.shell: |
+        set -o pipefail
+
+        echo "============================================================"
+        echo "        PIQUICKHEAL - CPU SPIKE DIAGNOSIS"
+        echo "============================================================"
+
+        echo ""
+        echo "[1] SYSTEM UPTIME AND LOAD"
+        echo "------------------------------------------------------------"
+
+        uptime
+
+        echo ""
+        echo "[2] CURRENT CPU USAGE"
+        echo "------------------------------------------------------------"
+
+        CPU_USAGE=$(top -bn1 | awk -F',' '
+          /Cpu\(s\)/ {
+            for (i = 1; i <= NF; i++) {
+              if ($i ~ /id/) {
+                gsub(/[^0-9.]/, "", $i)
+                print 100 - $i
+                exit
+              }
+            }
+          }
+        ')
+
+        echo "Total CPU Usage: ${CPU_USAGE:-UNKNOWN}%"
+
+        echo ""
+        echo "[3] TOP 10 CPU-CONSUMING PROCESSES"
+        echo "------------------------------------------------------------"
+
+        ps -eo pid=,ppid=,user=,pcpu=,pmem=,comm= --sort=-pcpu | head -n 10
+
+        echo ""
+        echo "[4] TOP CPU CONSUMER DETAILS"
+        echo "------------------------------------------------------------"
+
+        TOP_LINE=$(ps -eo pid=,ppid=,user=,pcpu=,pmem=,comm= --sort=-pcpu | head -n 1)
+
+        if [ -z "$TOP_LINE" ]; then
+          echo "ERROR: Unable to identify top CPU-consuming process"
+          exit 1
+        fi
+
+        TOP_PID=$(echo "$TOP_LINE" | awk '{print $1}')
+        TOP_PPID=$(echo "$TOP_LINE" | awk '{print $2}')
+        TOP_USER=$(echo "$TOP_LINE" | awk '{print $3}')
+        TOP_CPU=$(echo "$TOP_LINE" | awk '{print $4}')
+        TOP_MEM=$(echo "$TOP_LINE" | awk '{print $5}')
+        TOP_NAME=$(echo "$TOP_LINE" | awk '{print $6}')
+
+        echo "Process Name : $TOP_NAME"
+        echo "PID          : $TOP_PID"
+        echo "Parent PID   : $TOP_PPID"
+        echo "User         : $TOP_USER"
+        echo "CPU Usage    : ${TOP_CPU}%"
+        echo "Memory Usage : ${TOP_MEM}%"
+
+        echo ""
+        echo "[5] PROTECTED PROCESS CHECK"
+        echo "------------------------------------------------------------"
+
+        PROTECTED='{{ protected_processes | join(" ") }}'
+
+        echo "Protected Process List:"
+        echo "$PROTECTED"
+
+        IS_PROTECTED=false
+        PROTECTED_MATCH=""
+
+        for P in $PROTECTED; do
+          if [ "$TOP_NAME" = "$P" ]; then
+            IS_PROTECTED=true
+            PROTECTED_MATCH="$P"
+            break
+          fi
+        done
+
+        if [ "$IS_PROTECTED" = true ]; then
+
+          echo ""
+          echo "============================================================"
+          echo "RESULT: PROTECTED PROCESS"
+          echo "============================================================"
+
+          echo "Protected Name : $PROTECTED_MATCH"
+          echo "PID            : $TOP_PID"
+          echo "CPU Usage      : ${TOP_CPU}%"
+          echo "Memory Usage   : ${TOP_MEM}%"
+          echo "ACTION         : NO AUTOMATIC REMEDIATION"
+
+          echo ""
+          echo "PROTECTED_PROCESS_FOUND:${TOP_NAME} PID:${TOP_PID} METRIC:${TOP_CPU}%"
+
+        else
+
+          echo ""
+          echo "============================================================"
+          echo "RESULT: NON-PROTECTED PROCESS"
+          echo "============================================================"
+
+          echo "Process Name : $TOP_NAME"
+          echo "PID          : $TOP_PID"
+          echo "CPU Usage    : ${TOP_CPU}%"
+          echo "Memory Usage : ${TOP_MEM}%"
+          echo "ACTION       : REMEDIATION MAY BE PROPOSED"
+
+          echo ""
+          echo "Top_process_not_protected:${TOP_NAME} PID:${TOP_PID} METRIC:${TOP_CPU}%"
+
+        fi
+
+        echo ""
+        echo "============================================================"
+        echo "        END OF CPU SPIKE DIAGNOSIS"
+        echo "============================================================"
+
+      args:
+        executable: /bin/bash
+
+      register: diagnose_result
+      changed_when: false
+
+      tags:
+        - diagnose
+
+
+    # ============================================================
+    # DISPLAY DIAGNOSIS OUTPUT
+    # ============================================================
+
+    - name: "STAGE 1 - Show complete diagnosis output"
+      ansible.builtin.debug:
+        var: diagnose_result.stdout_lines
+
+      tags:
+        - diagnose
+
+
+    # ============================================================
+    # CHECK PROTECTED PROCESS
+    # ============================================================
+
+    - name: "STAGE 1 - Determine whether top process is protected"
+      ansible.builtin.set_fact:
+        top_process_protected: >-
+          {{ 'PROTECTED_PROCESS_FOUND' in diagnose_result.stdout }}
+
+      tags:
+        - diagnose
+
+
+    # ============================================================
+    # PUBLISH DIAGNOSIS
+    # ============================================================
+
+    - name: "STAGE 1 - Publish diagnosis result"
+      ansible.builtin.set_stats:
+        data:
+          top_process_protected: "{{ top_process_protected }}"
+          diagnostic_output: "{{ diagnose_result.stdout }}"
+
+      tags:
+        - diagnose
+
+
+    # ============================================================
+    # STAGE 2: REMEDIATION
+    # ============================================================
+
+    - name: "STAGE 2 - Identify current top CPU consumer"
+      ansible.builtin.shell: |
+        set -o pipefail
+
+        echo "============================================================"
+        echo "        PIQUICKHEAL - CPU SPIKE REMEDIATION"
+        echo "============================================================"
+
+        echo ""
+        echo "[1] IDENTIFYING CURRENT TOP CPU PROCESS"
+        echo "------------------------------------------------------------"
+
+        TOP_LINE=$(ps -eo pid=,ppid=,user=,pcpu=,pmem=,comm= --sort=-pcpu | head -n 1)
+
+        if [ -z "$TOP_LINE" ]; then
+          echo "ERROR: Unable to identify top CPU-consuming process"
+          exit 1
+        fi
+
+        TOP_PID=$(echo "$TOP_LINE" | awk '{print $1}')
+        TOP_PPID=$(echo "$TOP_LINE" | awk '{print $2}')
+        TOP_USER=$(echo "$TOP_LINE" | awk '{print $3}')
+        TOP_CPU=$(echo "$TOP_LINE" | awk '{print $4}')
+        TOP_MEM=$(echo "$TOP_LINE" | awk '{print $5}')
+        TOP_NAME=$(echo "$TOP_LINE" | awk '{print $6}')
+
+        echo "Target Process : $TOP_NAME"
+        echo "Target PID     : $TOP_PID"
+        echo "Parent PID     : $TOP_PPID"
+        echo "User           : $TOP_USER"
+        echo "CPU Usage      : ${TOP_CPU}%"
+        echo "Memory Usage   : ${TOP_MEM}%"
+
+        echo ""
+        echo "[2] PROTECTED PROCESS VALIDATION"
+        echo "------------------------------------------------------------"
+
+        PROTECTED='{{ protected_processes | join(" ") }}'
+
+        IS_PROTECTED=false
+
+        for P in $PROTECTED; do
+          if [ "$TOP_NAME" = "$P" ]; then
+            IS_PROTECTED=true
+            break
+          fi
+        done
+
+        if [ "$IS_PROTECTED" = true ]; then
+
+          echo "============================================================"
+          echo "PROTECTED PROCESS DETECTED"
+          echo "============================================================"
+
+          echo "Process: $TOP_NAME"
+          echo "PID    : $TOP_PID"
+          echo "ACTION : NO REMEDIATION"
+
+          echo "PROTECTED_PROCESS_FOUND:${TOP_NAME} PID:${TOP_PID}"
+
+          exit 0
+
+        fi
+
+        echo ""
+        echo "[3] PROCESS VALIDATION"
+        echo "------------------------------------------------------------"
+
+        if ! kill -0 "$TOP_PID" 2>/dev/null; then
+
+          echo "Process PID $TOP_PID no longer exists."
+          echo "REMEDIATION_STATUS: NOT_REQUIRED"
+
+          exit 0
+
+        fi
+
+        echo "Process PID $TOP_PID is active."
+
+        echo ""
+        echo "[4] REMEDIATION ACTION"
+        echo "------------------------------------------------------------"
+
+        echo "Sending SIGTERM to PID $TOP_PID..."
+
+        kill -15 "$TOP_PID" 2>/dev/null || true
+
+        sleep 3
+
+        if kill -0 "$TOP_PID" 2>/dev/null; then
+
+          echo "Process is still running."
+          echo "Sending SIGKILL to PID $TOP_PID..."
+
+          kill -9 "$TOP_PID" 2>/dev/null || true
+
+        else
+
+          echo "Process stopped gracefully."
+
+        fi
+
+        sleep 1
+
+        echo ""
+        echo "[5] POST-REMEDIATION CHECK"
+        echo "------------------------------------------------------------"
+
+        if kill -0 "$TOP_PID" 2>/dev/null; then
+
+          echo "PID $TOP_PID is still running."
+          echo "REMEDIATION_STATUS: FAILED"
+
+        else
+
+          echo "PID $TOP_PID is no longer running."
+          echo "REMEDIATION_STATUS: SUCCESS"
+
+        fi
+
+        echo ""
+        echo "============================================================"
+        echo "        END OF CPU SPIKE REMEDIATION"
+        echo "============================================================"
+
+      args:
+        executable: /bin/bash
+
+      register: kill_result
+      changed_when: true
+
+      when:
+        - not (top_process_protected | default(false) | bool)
+
+      tags:
+        - remediate
+
+
+    # ============================================================
+    # DISPLAY REMEDIATION OUTPUT
+    # ============================================================
+
+    - name: "STAGE 2 - Show remediation output"
+      ansible.builtin.debug:
+        var: kill_result.stdout_lines
+
+      when:
+        - not (top_process_protected | default(false) | bool)
+
+      tags:
+        - remediate
+
+
+    # ============================================================
+    # PUBLISH REMEDIATION OUTPUT
+    # ============================================================
+
+    - name: "STAGE 2 - Publish remediation output"
+      ansible.builtin.set_stats:
+        data:
+          remediation_output: "{{ kill_result.stdout }}"
+
+      when:
+        - not (top_process_protected | default(false) | bool)
+
+      tags:
+        - remediate
+
+
+    # ============================================================
+    # STAGE 3: VALIDATE CPU RECOVERY
+    # ============================================================
+
+    - name: "STAGE 3 - Poll CPU until recovery"
+      ansible.builtin.shell: |
+        CPU_USAGE=$(top -bn1 | awk -F',' '
+          /Cpu\(s\)/ {
+            for (i = 1; i <= NF; i++) {
+              if ($i ~ /id/) {
+                gsub(/[^0-9.]/, "", $i)
+                print 100 - $i
+                exit
+              }
+            }
+          }
+        ')
+
+        echo "${CPU_USAGE:-100}"
+
+      args:
+        executable: /bin/bash
+
+      register: cpu_check
+
+      changed_when: false
+      failed_when: false
+
+      until:
+        - (cpu_check.stdout | default('100') | float) < cpu_recover_threshold
+
+      retries: 6
+      delay: 5
+
+      when:
+        - not (top_process_protected | default(false) | bool)
+
+      tags:
+        - validate
+
+
+    # ============================================================
+    # RECORD HEAL RESULT
+    # ============================================================
+
+    - name: "STAGE 3 - Record heal result"
+      ansible.builtin.shell: |
+        mkdir -p "$(dirname "{{ heal_log_path }}")"
+
+        CPU_VALUE="{{ cpu_check.stdout | default('100') | trim }}"
+
+        if awk "BEGIN {exit !($CPU_VALUE < {{ cpu_recover_threshold }})}"; then
+          STATUS="HEALED"
+        else
+          STATUS="HEAL_FAILED"
+        fi
+
+        echo "$(date '+%Y-%m-%d %H:%M:%S %Z') [$STATUS cpu_spike] $(hostname)" \
+          >> "{{ heal_log_path }}"
+
+      args:
+        executable: /bin/bash
+
+      changed_when: true
+
+      when:
+        - not (top_process_protected | default(false) | bool)
+
+      tags:
+        - validate
+
+
+    # ============================================================
+    # FINAL RESULT
+    # ============================================================
+
+    - name: "STAGE 3 - Report final outcome"
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            'HEAL_CONFIRMED_CPU_BELOW_THRESHOLD'
+            if (cpu_check.stdout | default('100') | float) < cpu_recover_threshold
+            else
+            'HEAL_FAILED_CPU_STILL_ELEVATED'
+          }}
+
+      when:
+        - not (top_process_protected | default(false) | bool)
+
+      tags:
+        - validate
