@@ -1,6 +1,5 @@
 ---
 # PiQuickHeal - CPU Spike Diagnosis and Remediation
-#
 # AWX Job Templates:
 #
 # 1. piquickheal-cpu_spike-diagnose
